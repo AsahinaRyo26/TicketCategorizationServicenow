@@ -1,0 +1,10 @@
+flask
+joblib
+matplotlib
+nltk
+numpy
+pandas
+openpyxl
+requests
+scipy
+scikit-learn
