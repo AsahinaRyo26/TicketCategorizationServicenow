@@ -1,4 +1,5 @@
 flask
+gunicorn
 joblib
 matplotlib
 nltk
@@ -8,4 +9,3 @@ openpyxl
 requests
 scipy
 scikit-learn
-gunicorn
