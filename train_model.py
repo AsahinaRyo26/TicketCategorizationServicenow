@@ -42,17 +42,24 @@ warnings.filterwarnings("ignore")
 
 
 ASSIGNMENT_GROUP_COL = "Assignment group"
+CATEGORY_COL = "Category"
+SUBCATEGORY_COL = "Subcategory"
 SHORT_DESCRIPTION_COL = "Short description"
 DESCRIPTION_COL = "Description"
 
 MODEL_FILE = "model.pkl"
 VECTORIZER_FILE = "vectorizer.pkl"
 LABEL_ENCODER_FILE = "label_encoder.pkl"
+CATEGORY_MODEL_FILE = "category_model.pkl"
+CATEGORY_LABEL_ENCODER_FILE = "category_label_encoder.pkl"
+SUBCATEGORY_MODEL_FILE = "subcategory_model.pkl"
+SUBCATEGORY_LABEL_ENCODER_FILE = "subcategory_label_encoder.pkl"
 SVD_FILE = "svd_transformer.pkl"
 VECTORIZER_LEM_FILE = "vectorizer_lem.pkl"
 
 
 SERVICENOW_FIELD_MAP: Dict[str, str] = {
+    "Sys ID": "sys_id",
     "Number": "number",
     "Opened": "opened_at",
     "Short description": "short_description",
@@ -335,6 +342,38 @@ def load_dataset(args: argparse.Namespace) -> pd.DataFrame:
     raise FileNotFoundError("Could not find an Excel or CSV incidents file.")
 
 
+def train_optional_text_classifier(df, X, target_col, model_file, encoder_file):
+    if target_col not in df.columns:
+        print(f"\nSkipping {target_col} model: column is missing.")
+        return
+
+    target = df[target_col].replace("", pd.NA).dropna()
+    if target.empty:
+        print(f"\nSkipping {target_col} model: no usable values.")
+        return
+
+    normalized_target = df[target_col].replace("", pd.NA).astype("string").str.strip().str.lower()
+    counts = normalized_target.dropna().value_counts()
+    valid_values = counts[counts >= 10].index
+    mask = normalized_target.isin(valid_values).to_numpy()
+
+    if len(valid_values) < 2 or mask.sum() < 20:
+        print(f"\nSkipping {target_col} model: not enough training data.")
+        return
+
+    label_encoder = LabelEncoder()
+    y_target = label_encoder.fit_transform(normalized_target[mask])
+
+    model = LogisticRegression(max_iter=2500, C=0.3)
+    model.fit(X[mask], y_target)
+
+    joblib.dump(model, model_file)
+    joblib.dump(label_encoder, encoder_file)
+
+    print(f"\nSaved {target_col} model: {model_file}")
+    print(f"Saved {target_col} label encoder: {encoder_file}")
+
+
 def calculate_metrics(y_true, predictions):
     return {
         "Accuracy": accuracy_score(y_true, predictions),
@@ -426,6 +465,7 @@ def train(args: argparse.Namespace) -> None:
 
     valid_groups = group_counts[group_counts >= 10].index
     df = df[df[ASSIGNMENT_GROUP_COL].isin(valid_groups)]
+    df = df.reset_index(drop=True)
     print(f"\nAfter filtering rare groups: {df[ASSIGNMENT_GROUP_COL].nunique()} groups remain")
 
     print("\n" + "=" * 60)
@@ -659,6 +699,21 @@ def train(args: argparse.Namespace) -> None:
     joblib.dump(label_encoder, LABEL_ENCODER_FILE)
     joblib.dump(svd, SVD_FILE)
 
+    train_optional_text_classifier(
+        df,
+        X,
+        CATEGORY_COL,
+        CATEGORY_MODEL_FILE,
+        CATEGORY_LABEL_ENCODER_FILE,
+    )
+    train_optional_text_classifier(
+        df,
+        X,
+        SUBCATEGORY_COL,
+        SUBCATEGORY_MODEL_FILE,
+        SUBCATEGORY_LABEL_ENCODER_FILE,
+    )
+
     print(f"\nSaved {MODEL_FILE}")
     print(f"Saved {VECTORIZER_FILE}")
     if use_lemmatizer and vectorizer_lem is not None:
@@ -695,7 +750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source",
         choices=["file", "servicenow"],
-        default=os.getenv("TRAINING_SOURCE", "file"),
+        default=os.getenv("TRAINING_SOURCE", "servicenow"),
         help="Use a local spreadsheet/CSV or fetch incidents from ServiceNow.",
     )
     parser.add_argument(
@@ -711,7 +766,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--query",
-        default=os.getenv("SERVICENOW_QUERY", "assignment_groupISNOTEMPTY"),
+        default=os.getenv(
+            "SERVICENOW_QUERY",
+            "assignment_groupISNOTEMPTY^categoryISNOTEMPTY^subcategoryISNOTEMPTY",
+        ),
         help="ServiceNow encoded query, for example assignment_groupISNOTEMPTY^active=false.",
     )
     return parser.parse_args()
