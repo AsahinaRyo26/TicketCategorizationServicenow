@@ -1,3 +1,4 @@
+import hmac
 import os
 import re
 from typing import Dict, List
@@ -32,6 +33,8 @@ SUBCATEGORY_LABEL_ENCODER_FILE = "subcategory_label_encoder.pkl"
 
 SHORT_DESCRIPTION_COL = "Short description"
 DESCRIPTION_COL = "Description"
+
+WEBHOOK_SECRET_HEADER = "X-ServiceNow-Webhook-Secret"
 
 
 SERVICENOW_FIELD_MAP: Dict[str, str] = {
@@ -347,6 +350,138 @@ def update_servicenow_incident(sys_id: str, fields: dict) -> dict:
     return response.json().get("result", {})
 
 
+def auto_assign_overwrite_enabled() -> bool:
+    """Whether the creation webhook may replace an existing assignment group."""
+    return os.getenv("SERVICENOW_AUTO_ASSIGN_OVERWRITE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def auto_assign_minimum_confidence() -> float:
+    """Return the optional confidence floor for automatic assignment."""
+    raw_value = os.getenv("SERVICENOW_AUTO_ASSIGN_MIN_CONFIDENCE", "0").strip()
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "SERVICENOW_AUTO_ASSIGN_MIN_CONFIDENCE must be a number from 0 to 1."
+        ) from exc
+
+    if not 0 <= value <= 1:
+        raise RuntimeError(
+            "SERVICENOW_AUTO_ASSIGN_MIN_CONFIDENCE must be a number from 0 to 1."
+        )
+    return value
+
+
+def is_valid_servicenow_webhook(request_secret: str) -> bool:
+    """Validate ServiceNow's shared-secret header without logging the secret."""
+    configured_secret = os.getenv("SERVICENOW_WEBHOOK_SECRET", "")
+    return bool(configured_secret and request_secret) and hmac.compare_digest(
+        configured_secret, request_secret
+    )
+
+
+def get_webhook_incident_identifier(data: dict) -> tuple[str, str]:
+    """Accept the compact body sent by the ServiceNow Flow/Business Rule."""
+    if not isinstance(data, dict):
+        raise ValueError("Webhook JSON body must be an object.")
+
+    # Supporting an `incident` object keeps the endpoint convenient for Flow Designer.
+    incident_data = data.get("incident", data)
+    if not isinstance(incident_data, dict):
+        raise ValueError("incident must be an object when supplied.")
+
+    sys_id = str(incident_data.get("sys_id", "")).strip()
+    number = str(incident_data.get("number", "")).strip()
+    if not sys_id and not number:
+        raise ValueError("Provide the created incident's sys_id or number.")
+    return sys_id, number
+
+
+def build_assignment_update(incident: dict) -> tuple[dict, dict]:
+    """Use the existing trained models to construct ServiceNow update fields."""
+    prediction = predict_from_text(
+        short_description=incident.get(SHORT_DESCRIPTION_COL, ""),
+        description=incident.get(DESCRIPTION_COL, ""),
+    )
+
+    update_fields = {}
+    group_sys_id = resolve_assignment_group_sys_id(
+        prediction.get("predicted_assignment_group", "")
+    )
+    if group_sys_id:
+        update_fields["assignment_group"] = group_sys_id
+    else:
+        # Preserve the existing predict_and_update endpoint behavior: the ServiceNow
+        # API may resolve the display value when an exact group sys_id is unavailable.
+        update_fields["assignment_group"] = prediction.get("predicted_assignment_group", "")
+
+    if prediction.get("predicted_category"):
+        update_fields["category"] = prediction["predicted_category"]
+    if prediction.get("predicted_subcategory"):
+        update_fields["subcategory"] = prediction["predicted_subcategory"]
+
+    return prediction, update_fields
+
+
+def auto_assign_created_incident(data: dict) -> dict:
+    """Predict and immediately update one newly-created ServiceNow incident.
+
+    The operation is idempotent: a retry does not overwrite an already assigned
+    ticket unless SERVICENOW_AUTO_ASSIGN_OVERWRITE is explicitly enabled.
+    """
+    sys_id, number = get_webhook_incident_identifier(data)
+    if not sys_id:
+        sys_id = find_incident_sys_id(number)
+
+    rows = fetch_servicenow_incidents(limit=1, query=f"sys_id={sys_id}")
+    if not rows:
+        raise RuntimeError("Incident not found")
+
+    incident = rows[0]
+    current_group = str(incident.get("Assignment group", "") or "").strip()
+    if current_group and not auto_assign_overwrite_enabled():
+        return {
+            "number": incident.get("Number", number),
+            "sys_id": sys_id,
+            "updated": False,
+            "skipped": True,
+            "reason": "incident_already_has_assignment_group",
+            "current_assignment_group": current_group,
+        }
+
+    prediction, update_fields = build_assignment_update(incident)
+    confidence = prediction.get("confidence")
+    minimum_confidence = auto_assign_minimum_confidence()
+    if minimum_confidence and (
+        confidence is None or float(confidence) < minimum_confidence
+    ):
+        return {
+            "number": incident.get("Number", number),
+            "sys_id": sys_id,
+            "updated": False,
+            "skipped": True,
+            "reason": "prediction_below_confidence_threshold",
+            "prediction": prediction,
+            "minimum_confidence": minimum_confidence,
+        }
+
+    updated_incident = update_servicenow_incident(sys_id, update_fields)
+    return {
+        "number": incident.get("Number", number),
+        "sys_id": sys_id,
+        "updated": True,
+        "skipped": False,
+        "prediction": prediction,
+        "update_fields": update_fields,
+        "servicenow_result": updated_incident,
+    }
+
+
 def build_text_vector(combined_text: str):
     processed_text = preprocess_text(combined_text, use_lemmatization=False)
     text_vector = vectorizer.transform([processed_text])
@@ -445,6 +580,7 @@ def home():
                 "GET /servicenow/incidents",
                 "POST /servicenow/predict",
                 "POST /servicenow/predict_and_update",
+                "POST /servicenow/webhook/assign",
             ],
         }
     )
@@ -465,6 +601,13 @@ def health():
             "servicenow_instance_configured": bool(os.getenv("SERVICENOW_INSTANCE_URL")),
             "servicenow_username_configured": bool(os.getenv("SERVICENOW_USERNAME")),
             "servicenow_password_configured": bool(os.getenv("SERVICENOW_PASSWORD")),
+            "servicenow_webhook_secret_configured": bool(
+                os.getenv("SERVICENOW_WEBHOOK_SECRET")
+            ),
+            "servicenow_auto_assign_overwrite": auto_assign_overwrite_enabled(),
+            "servicenow_auto_assign_min_confidence": os.getenv(
+                "SERVICENOW_AUTO_ASSIGN_MIN_CONFIDENCE", "0"
+            ),
         }
     )
 
@@ -580,24 +723,7 @@ def servicenow_predict_and_update():
             return jsonify({"error": "Incident not found"}), 404
 
         incident = rows[0]
-        prediction = predict_from_text(
-            short_description=incident.get(SHORT_DESCRIPTION_COL, ""),
-            description=incident.get(DESCRIPTION_COL, ""),
-        )
-
-        update_fields = {}
-        group_sys_id = resolve_assignment_group_sys_id(
-            prediction.get("predicted_assignment_group", "")
-        )
-        if group_sys_id:
-            update_fields["assignment_group"] = group_sys_id
-        else:
-            update_fields["assignment_group"] = prediction.get("predicted_assignment_group", "")
-
-        if prediction.get("predicted_category"):
-            update_fields["category"] = prediction["predicted_category"]
-        if prediction.get("predicted_subcategory"):
-            update_fields["subcategory"] = prediction["predicted_subcategory"]
+        prediction, update_fields = build_assignment_update(incident)
 
         updated_incident = None
         if apply_update:
@@ -618,6 +744,25 @@ def servicenow_predict_and_update():
         return jsonify({"error": "ServiceNow request failed", "details": str(exc)}), 502
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/servicenow/webhook/assign", methods=["POST"])
+def servicenow_webhook_assign():
+    """Receive the post-insert event from ServiceNow and assign its ticket."""
+    request_secret = request.headers.get(WEBHOOK_SECRET_HEADER, "")
+    if not is_valid_servicenow_webhook(request_secret):
+        return jsonify({"error": "Unauthorized webhook request"}), 403
+
+    try:
+        data = request.get_json(silent=True) or {}
+        result = auto_assign_created_incident(data)
+        return jsonify(result), 200
+    except requests.HTTPError as exc:
+        return jsonify({"error": "ServiceNow request failed", "details": str(exc)}), 502
+    except Exception as exc:
+        # A non-2xx response makes a Flow/REST Message run visibly fail instead of
+        # silently leaving a newly-created incident unassigned.
+        return jsonify({"error": str(exc)}), 500
 
 
 if __name__ == "__main__":
